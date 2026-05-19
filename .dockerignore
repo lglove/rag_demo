@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.git/
+data/*.json
+tests/__pycache__/
+AI 应用开发工程师 - 实践题.pdf

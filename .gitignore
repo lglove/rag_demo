@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.venv/
+venv/
+.env
+data/*.json
+AI 应用开发工程师 - 实践题.pdf
