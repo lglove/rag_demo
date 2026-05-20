@@ -2,6 +2,20 @@
 
 这是一个 Python + FastAPI 实现的最小 RAG 系统，支持文档上传、文档向量化、相似度检索、基于检索结果生成回答，并返回引用来源。
 
+## 设计说明目录
+
+题目要求的 README 说明对应以下章节：
+
+```text
+1. 系统架构设计 -> 1. 系统架构设计
+2. 模块划分 -> 2. 模块划分
+3. RAG 流程说明 -> 3. RAG 流程说明
+4. Prompt 设计思路 -> 4. Prompt 设计思路
+5. 如何避免 hallucination -> 5. 如何避免 hallucination
+6. 如果要支持 10 万 QPS，应如何优化？ -> 6. 如果要支持 10 万 QPS，应如何优化？
+7. 如果 embedding 模型升级，应如何平滑迁移？ -> 7. 如果 embedding 模型升级，应如何平滑迁移？
+```
+
 ## 启动
 
 ```bash
@@ -205,7 +219,7 @@ DELETE /documents/{document_id}
 
 删除该文档的 metadata 和所有 chunks。embedding cache 不删除，因为相同内容可能被其他文档复用。
 
-## 架构设计
+## 1. 系统架构设计
 
 系统分为 API 层、服务层、核心能力层、Provider 抽象层和存储层。
 
@@ -245,7 +259,7 @@ JsonVectorStore
 
 后续可以替换为 OpenAI、Claude、Gemini、FAISS、Qdrant、Milvus 或 Chroma。
 
-## 模块划分
+## 2. 模块划分
 
 ```text
 app/api              HTTP 接口
@@ -278,7 +292,7 @@ tests                基础接口测试
 
 检索时如果传入 `document_ids`，向量库先按 `document_id` 过滤，再计算相似度。
 
-## RAG 流程
+## 3. RAG 流程说明
 
 上传流程：
 
@@ -306,7 +320,7 @@ tests                基础接口测试
   -> 返回 answer + sources
 ```
 
-## Prompt 设计思路
+## 4. Prompt 设计思路
 
 Prompt 明确要求模型只能基于检索片段回答：
 
@@ -324,7 +338,7 @@ Prompt 明确要求模型只能基于检索片段回答：
 引用来源编号
 ```
 
-## 如何避免 hallucination
+## 5. 如何避免 hallucination
 
 当前实现包含四层基础防护：
 
@@ -353,7 +367,7 @@ embedding_model:content_hash
 
 这样同样内容在同一个 embedding 模型下不会重复计算。缓存和文档归属解耦，因此删除某个文档不会删除 cache。
 
-## 如果要支持 10 万 QPS
+## 6. 如果要支持 10 万 QPS，应如何优化？
 
 需要从单机 Demo 升级为分布式架构：
 
@@ -371,7 +385,7 @@ embedding_model:content_hash
 
 10 万 QPS 下 LLM 调用通常是瓶颈，必须依赖缓存、路由、降级和异步架构。
 
-## 如果 embedding 模型升级
+## 7. 如果 embedding 模型升级，应如何平滑迁移？
 
 不要覆盖旧向量。应保留模型版本：
 
