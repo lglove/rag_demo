@@ -4,16 +4,192 @@
 
 ## 设计说明目录
 
-题目要求的 README 说明对应以下章节：
+## 1. 系统架构设计
+
+系统分为 API 层、服务层、核心能力层、Provider 抽象层和存储层。
 
 ```text
-1. 系统架构设计 -> 1. 系统架构设计
-2. 模块划分 -> 2. 模块划分
-3. RAG 流程说明 -> 3. RAG 流程说明
-4. Prompt 设计思路 -> 4. Prompt 设计思路
-5. 如何避免 hallucination -> 5. 如何避免 hallucination
-6. 如果要支持 10 万 QPS，应如何优化？ -> 6. 如果要支持 10 万 QPS，应如何优化？
-7. 如果 embedding 模型升级，应如何平滑迁移？ -> 7. 如果 embedding 模型升级，应如何平滑迁移？
+FastAPI API
+  -> DocumentService / QAService
+  -> Text Splitter / Prompt Builder
+  -> EmbeddingProvider / LLMProvider / VectorStore
+  -> JSON documents / chunks / embedding cache
+```
+
+业务层只依赖抽象接口：
+
+```python
+class BaseLLMProvider:
+    def generate(self, prompt: str) -> str:
+        raise NotImplementedError
+
+class BaseEmbeddingProvider:
+    def embed_text(self, text: str) -> list[float]:
+        raise NotImplementedError
+
+class BaseVectorStore:
+    def search(...):
+        raise NotImplementedError
+```
+
+当前默认实现：
+
+```text
+MockLLMProvider
+DeepSeekLLMProvider
+OpenAILLMProvider
+MockEmbeddingProvider
+JsonVectorStore
+```
+
+后续可以替换为 OpenAI、Claude、Gemini、FAISS、Qdrant、Milvus 或 Chroma。
+
+## 2. 模块划分
+
+```text
+app/api              HTTP 接口
+app/services         上传、更新、问答编排
+app/core             schema、切分、prompt
+app/providers        LLM 和 Embedding 抽象及实现
+app/vectorstores     向量库抽象及 JSON 实现
+app/repositories     文档、chunk、embedding cache 持久化
+tests                基础接口测试
+```
+
+## 文档隔离设计
+
+本版本只按 `document_id` 做隔离。
+
+每个文档上传后生成独立 `document_id`。每个 chunk 都保存：
+
+```json
+{
+  "document_id": "doc_xxx",
+  "document_version": 1,
+  "chunk_id": 3,
+  "filename": "employee_handbook.md",
+  "content": "...",
+  "content_hash": "sha256_xxx",
+  "embedding_model": "mock-embedding-v1",
+  "embedding": []
+}
+```
+
+检索时如果传入 `document_ids`，向量库先按 `document_id` 过滤，再计算相似度。
+
+## 3. RAG 流程说明
+
+上传流程：
+
+```text
+上传 txt/md
+  -> 读取文本
+  -> 文本切分
+  -> 计算 chunk hash
+  -> 命中 embedding cache 则复用
+  -> 未命中则生成 embedding
+  -> chunk 写入向量库
+  -> document metadata 写入仓储
+```
+
+问答流程：
+
+```text
+用户问题
+  -> 问题 embedding
+  -> 按 document_id 和 active_version 过滤
+  -> Top-K 相似度检索
+  -> 相似度阈值判断
+  -> 构造 Prompt
+  -> 调用 LLM
+  -> 返回 answer + sources
+```
+
+## 4. Prompt 设计思路
+
+Prompt 明确要求模型只能基于检索片段回答：
+
+```text
+请严格基于以下【知识库片段】回答用户问题。
+如果知识库片段中没有足够信息，请回答：
+“根据当前知识库内容，无法回答该问题。”
+```
+
+同时要求：
+
+```text
+不编造不存在的信息
+不使用外部常识补充
+引用来源编号
+```
+
+## 5. 如何避免 hallucination
+
+当前实现包含四层基础防护：
+
+```text
+1. 没有文档或没有检索结果时拒答
+2. Top-K 结果低于 MIN_SCORE_THRESHOLD 时拒答
+3. Prompt 约束只能基于知识库片段回答
+4. 返回 sources，方便用户核查
+```
+
+生产环境可继续增加答案一致性校验，让另一个模型判断答案是否完全被 sources 支撑。
+
+## 避免重复 embedding
+
+每个 chunk 计算：
+
+```text
+content_hash = sha256(chunk_content)
+```
+
+embedding cache 的 key 是：
+
+```text
+embedding_model:content_hash
+```
+
+这样同样内容在同一个 embedding 模型下不会重复计算。缓存和文档归属解耦，因此删除某个文档不会删除 cache。
+
+## 6. 如果要支持 10 万 QPS，应如何优化？
+
+需要从单机 Demo 升级为分布式架构：
+
+```text
+1. API Gateway + 多实例 FastAPI 水平扩展
+2. 文档上传异步化，使用 Kafka/RabbitMQ/Celery
+3. embedding 服务独立部署，支持批量推理和 GPU
+4. 使用 Qdrant/Milvus/Pinecone 等分布式向量数据库
+5. 高频问题缓存：问题 embedding、检索结果、最终答案
+6. 多级检索：BM25 粗召回 + 向量召回 + rerank
+7. 模型路由：简单问题走小模型，复杂问题走大模型
+8. LLM 限流、熔断、降级和流式返回
+9. 按 document_id 或业务域分片，降低单次检索范围
+```
+
+10 万 QPS 下 LLM 调用通常是瓶颈，必须依赖缓存、路由、降级和异步架构。
+
+## 7. 如果 embedding 模型升级，应如何平滑迁移？
+
+不要覆盖旧向量。应保留模型版本：
+
+```text
+embedding_model = text-embedding-3-small@v1
+embedding_model = text-embedding-3-small@v2
+```
+
+迁移流程：
+
+```text
+1. 新模型作为 v2 上线
+2. 新上传文档写入 v2 embedding
+3. 老文档后台异步重算 v2 embedding
+4. 查询层支持按 embedding_model 检索
+5. 灰度部分流量到 v2
+6. 对比召回率、答案质量、延迟和成本
+7. 稳定后切默认版本
+8. 保留 v1 一段时间用于回滚
 ```
 
 ## 启动
@@ -218,194 +394,6 @@ DELETE /documents/{document_id}
 ```
 
 删除该文档的 metadata 和所有 chunks。embedding cache 不删除，因为相同内容可能被其他文档复用。
-
-## 1. 系统架构设计
-
-系统分为 API 层、服务层、核心能力层、Provider 抽象层和存储层。
-
-```text
-FastAPI API
-  -> DocumentService / QAService
-  -> Text Splitter / Prompt Builder
-  -> EmbeddingProvider / LLMProvider / VectorStore
-  -> JSON documents / chunks / embedding cache
-```
-
-业务层只依赖抽象接口：
-
-```python
-class BaseLLMProvider:
-    def generate(self, prompt: str) -> str:
-        raise NotImplementedError
-
-class BaseEmbeddingProvider:
-    def embed_text(self, text: str) -> list[float]:
-        raise NotImplementedError
-
-class BaseVectorStore:
-    def search(...):
-        raise NotImplementedError
-```
-
-当前默认实现：
-
-```text
-MockLLMProvider
-DeepSeekLLMProvider
-OpenAILLMProvider
-MockEmbeddingProvider
-JsonVectorStore
-```
-
-后续可以替换为 OpenAI、Claude、Gemini、FAISS、Qdrant、Milvus 或 Chroma。
-
-## 2. 模块划分
-
-```text
-app/api              HTTP 接口
-app/services         上传、更新、问答编排
-app/core             schema、切分、prompt
-app/providers        LLM 和 Embedding 抽象及实现
-app/vectorstores     向量库抽象及 JSON 实现
-app/repositories     文档、chunk、embedding cache 持久化
-tests                基础接口测试
-```
-
-## 文档隔离设计
-
-本版本只按 `document_id` 做隔离。
-
-每个文档上传后生成独立 `document_id`。每个 chunk 都保存：
-
-```json
-{
-  "document_id": "doc_xxx",
-  "document_version": 1,
-  "chunk_id": 3,
-  "filename": "employee_handbook.md",
-  "content": "...",
-  "content_hash": "sha256_xxx",
-  "embedding_model": "mock-embedding-v1",
-  "embedding": []
-}
-```
-
-检索时如果传入 `document_ids`，向量库先按 `document_id` 过滤，再计算相似度。
-
-## 3. RAG 流程说明
-
-上传流程：
-
-```text
-上传 txt/md
-  -> 读取文本
-  -> 文本切分
-  -> 计算 chunk hash
-  -> 命中 embedding cache 则复用
-  -> 未命中则生成 embedding
-  -> chunk 写入向量库
-  -> document metadata 写入仓储
-```
-
-问答流程：
-
-```text
-用户问题
-  -> 问题 embedding
-  -> 按 document_id 和 active_version 过滤
-  -> Top-K 相似度检索
-  -> 相似度阈值判断
-  -> 构造 Prompt
-  -> 调用 LLM
-  -> 返回 answer + sources
-```
-
-## 4. Prompt 设计思路
-
-Prompt 明确要求模型只能基于检索片段回答：
-
-```text
-请严格基于以下【知识库片段】回答用户问题。
-如果知识库片段中没有足够信息，请回答：
-“根据当前知识库内容，无法回答该问题。”
-```
-
-同时要求：
-
-```text
-不编造不存在的信息
-不使用外部常识补充
-引用来源编号
-```
-
-## 5. 如何避免 hallucination
-
-当前实现包含四层基础防护：
-
-```text
-1. 没有文档或没有检索结果时拒答
-2. Top-K 结果低于 MIN_SCORE_THRESHOLD 时拒答
-3. Prompt 约束只能基于知识库片段回答
-4. 返回 sources，方便用户核查
-```
-
-生产环境可继续增加答案一致性校验，让另一个模型判断答案是否完全被 sources 支撑。
-
-## 避免重复 embedding
-
-每个 chunk 计算：
-
-```text
-content_hash = sha256(chunk_content)
-```
-
-embedding cache 的 key 是：
-
-```text
-embedding_model:content_hash
-```
-
-这样同样内容在同一个 embedding 模型下不会重复计算。缓存和文档归属解耦，因此删除某个文档不会删除 cache。
-
-## 6. 如果要支持 10 万 QPS，应如何优化？
-
-需要从单机 Demo 升级为分布式架构：
-
-```text
-1. API Gateway + 多实例 FastAPI 水平扩展
-2. 文档上传异步化，使用 Kafka/RabbitMQ/Celery
-3. embedding 服务独立部署，支持批量推理和 GPU
-4. 使用 Qdrant/Milvus/Pinecone 等分布式向量数据库
-5. 高频问题缓存：问题 embedding、检索结果、最终答案
-6. 多级检索：BM25 粗召回 + 向量召回 + rerank
-7. 模型路由：简单问题走小模型，复杂问题走大模型
-8. LLM 限流、熔断、降级和流式返回
-9. 按 document_id 或业务域分片，降低单次检索范围
-```
-
-10 万 QPS 下 LLM 调用通常是瓶颈，必须依赖缓存、路由、降级和异步架构。
-
-## 7. 如果 embedding 模型升级，应如何平滑迁移？
-
-不要覆盖旧向量。应保留模型版本：
-
-```text
-embedding_model = text-embedding-3-small@v1
-embedding_model = text-embedding-3-small@v2
-```
-
-迁移流程：
-
-```text
-1. 新模型作为 v2 上线
-2. 新上传文档写入 v2 embedding
-3. 老文档后台异步重算 v2 embedding
-4. 查询层支持按 embedding_model 检索
-5. 灰度部分流量到 v2
-6. 对比召回率、答案质量、延迟和成本
-7. 稳定后切默认版本
-8. 保留 v1 一段时间用于回滚
-```
 
 ## 测试
 
